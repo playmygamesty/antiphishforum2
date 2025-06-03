@@ -4,12 +4,16 @@ from flask_login import LoginManager, login_user, logout_user, current_user, log
 from models import db, User, Post, Reply
 from forms import LoginForm, RegisterForm, PostForm, ReplyForm, ProfileForm
 import os
+import requests
+import re
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'devsecret')
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///forum.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
+
+VIRUSTOTAL_API_KEY = "d964d40764abcdd46e32258ddb64b9bdd73c10dea167fa949d579122564b8b79"
 
 @app.template_filter('user_from_id')
 def user_from_id(user_id):
@@ -44,12 +48,64 @@ def setup_db():
             db.session.add(admin)
         if not User.query.filter_by(username='antiphish').first():
             bot = User(username='antiphish', role='bot')
-            bot.set_password('!!!') # Not used
+            bot.set_password('!!!') # Not used, never allow login
             db.session.add(bot)
         db.session.commit()
 
 # Ensure database setup runs on every start (both dev and prod)
 setup_db()
+
+# ---- BOT LOGIC ----
+def extract_url_from_command(text):
+    # Extract a URL after the command
+    match = re.search(r'@antiphish run check (https?://\S+)', text)
+    return match.group(1) if match else None
+
+def virustotal_check_url(url):
+    try:
+        # Submit URL for scanning
+        resp = requests.post(
+            "https://www.virustotal.com/api/v3/urls",
+            headers={"x-apikey": VIRUSTOTAL_API_KEY},
+            data={"url": url}
+        )
+        if resp.status_code != 200:
+            return "VirusTotal: Failed to submit URL for scanning."
+        vt_id = resp.json()["data"]["id"]
+        # Get the scan report
+        report = requests.get(
+            f"https://www.virustotal.com/api/v3/analyses/{vt_id}",
+            headers={"x-apikey": VIRUSTOTAL_API_KEY}
+        )
+        if report.status_code != 200:
+            return "VirusTotal: Failed to retrieve report."
+        stats = report.json()["data"]["attributes"]["stats"]
+        result = (
+            f"**VirusTotal Results for {url}:**\n"
+            f"Malicious: {stats.get('malicious', 0)}\n"
+            f"Suspicious: {stats.get('suspicious', 0)}\n"
+            f"Harmless: {stats.get('harmless', 0)}\n"
+            f"Undetected: {stats.get('undetected', 0)}"
+        )
+        return result
+    except Exception as e:
+        return f"Error checking URL: {e}"
+
+def antiphish_bot_check(reply_text, post_id):
+    url = extract_url_from_command(reply_text)
+    if url:
+        bot_user = User.query.filter_by(username='antiphish').first()
+        if bot_user:
+            report = virustotal_check_url(url)
+            ai_reply = Reply(
+                body=f"[AntiPhish Bot] Safety report for {url}:\n{report}",
+                author_id=bot_user.id,
+                post_id=post_id
+            )
+            db.session.add(ai_reply)
+            db.session.commit()
+
+# ---- END BOT LOGIC ----
 
 @app.route('/')
 def index():
@@ -63,7 +119,7 @@ def login():
     form = LoginForm()
     if form.validate_on_submit():
         user = User.query.filter_by(username=form.username.data).first()
-        if user and user.check_password(form.password.data):
+        if user and user.role != 'bot' and user.check_password(form.password.data):
             login_user(UserLogin(user))
             return redirect(url_for('index'))
         flash('Invalid username or password')
@@ -86,6 +142,7 @@ def register():
         else:
             user = User(username=form.username.data)
             user.set_password(form.password.data)
+            # Email is optional, no need to set unless provided
             db.session.add(user)
             db.session.commit()
             flash('Registration successful. Please log in.')
@@ -113,16 +170,7 @@ def show_post(post_id):
         db.session.add(reply)
         db.session.commit()
         # AI bot check
-        if '@antiphish run check' in form.body.data:
-            url = form.body.data.split('@antiphish run check', 1)[1].strip()
-            # Simulate AI check (replace with API call to Replit AI)
-            ai_reply = Reply(
-                body=f"[AntiPhish Bot] Safety report for {url}:\nThis is a placeholder response.",
-                author_id=User.query.filter_by(username='antiphish').first().id,
-                post_id=post_id
-            )
-            db.session.add(ai_reply)
-            db.session.commit()
+        antiphish_bot_check(form.body.data, post_id)
         return redirect(url_for('show_post', post_id=post_id))
     replies = Reply.query.filter_by(post_id=post_id).order_by(Reply.created_at).all()
     return render_template('post.html', post=post, author=author, replies=replies, form=form, new=False)
